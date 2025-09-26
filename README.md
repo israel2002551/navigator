@@ -1,5 +1,7 @@
-<html>
+<!doctype html>
+<html lang="en">
 <head>
+<meta charset="utf-8" />
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>ESP32 Mission Planner — Advanced</title>
 
@@ -45,6 +47,12 @@
   .playback input[type="range"] { width:160px; }
 
   .arrowMarker { transform-origin:center; }
+  .robotIcon div { transform-origin:center; }
+
+  @media (max-width:900px){
+    .topRow{flex-direction:column}
+    .rightCol{width:100%}
+  }
 </style>
 </head>
 <body>
@@ -327,7 +335,11 @@ function setupUI(){
   document.getElementById('fetchMissionBtn').addEventListener('click', () => {
     robotRef.child('mission').once('value', snap => {
       if (!snap.exists()) alert('No mission found.');
-      else alert('Mission fetched.');
+      else {
+        const mission = snap.val();
+        renderMission(mission);
+        alert('Mission fetched and rendered.');
+      }
     });
   });
 
@@ -408,7 +420,7 @@ function renderMission(mission) {
 
   const latlngs = mission.waypoints.map(wp => [wp.lat, wp.lon]);
   missionRouteLayer.setLatLngs(latlngs);
-  map.fitBounds(missionRouteLayer.getBounds(), { padding:[40,40] });
+  try { map.fitBounds(missionRouteLayer.getBounds(), { padding:[40,40] }); } catch(e){}
 
   // add markers and turns (simple arrows at each segment)
   const turns = [];
@@ -418,7 +430,7 @@ function renderMission(mission) {
     if (i < latlngs.length-1) {
       // compute bearing for arrow
       const a = latlngs[i], b = latlngs[i+1];
-      const bearing = turf.bearing(turf.point([a[1], a[0]]), turf.point([b[1], b[0]])); // note turf uses [lon,lat]
+      const bearing = turf.bearing(turf.point([a[1], a[0]]), turf.point([b[1], b[0]])); // turf uses [lon,lat]
       // arrow as rotated divIcon
       const arrow = L.marker([(a[0]+b[0])/2, (a[1]+b[1])/2], {
         icon: L.divIcon({
@@ -449,7 +461,7 @@ function updateStatusUI(status) {
   const battery = typeof status.battery === 'number' ? status.battery+'%' : 'N/A';
   const speed = typeof status.speed === 'number' ? status.speed.toFixed(2)+' m/s' : 'N/A';
   const ultrasonic = typeof status.ultrasonic === 'number' ? status.ultrasonic.toFixed(1)+' cm' : 'N/A';
-  const ts = status.timestamp ? new Date(status.timestamp).toLocaleTimeString() : new Date().toLocaleTimeString();
+  const ts = status.ts ? new Date(status.ts*1000).toLocaleTimeString() : new Date().toLocaleTimeString();
 
   display.innerHTML = `
     <span class="status-text">Lat: ${lat}</span>
@@ -473,8 +485,9 @@ function handleRobotMovement(status) {
   if (!robotMarker) {
     robotMarker = L.marker(dest, {
       icon: L.divIcon({ html:`<div style="font-size:26px; transform: rotate(${heading||0}deg)">🤖</div>`, className:'robotIcon' }),
-      rotationAngle: heading || 0
+      interactive:false
     }).addTo(map);
+    if (followRobot) map.panTo(dest);
   } else {
     animateRobotTo(dest, heading);
   }
@@ -505,7 +518,7 @@ function animateRobotTo(destLatLng, heading) {
   if (!robotMarker) { robotMarker = L.marker(dest).addTo(map); return; }
   const start = robotMarker.getLatLng();
   const frames = 18;
-  const duration = Math.max(600, Math.min(1400, 1000 / playbackSpeed)); // ms, adjusted by playbackSpeed
+  const duration = Math.max(300, Math.min(1200, 800 / playbackSpeed)); // ms, adjusted by playbackSpeed
   const stepMs = duration / frames;
   let i = 0;
   const latStep = (dest.lat - start.lat) / frames;
@@ -534,12 +547,14 @@ function computeProgressPercent(robotLatLng, waypoints) {
     // turf expects [lon,lat]
     const line = turf.lineString(waypoints.map(w => [w.lon, w.lat]));
     const pt = turf.point([robotLatLng.lng, robotLatLng.lat]);
-    // find nearest point on line and distance from start to it
-    const snapped = turf.nearestPointOnLine(line, pt);
-    const distToSnapped = turf.length(turf.lineSlice(turf.point(line.geometry.coordinates[0]), snapped, line), {units:'kilometers'}) || 0;
-    const total = turf.length(line, {units:'kilometers'}) || 0;
-    if (total === 0) return 0;
-    return (distToSnapped / total) * 100;
+    const snapped = turf.nearestPointOnLine(line, pt, {units:'kilometers'});
+    // distance from start to snapped point
+    const startPoint = turf.point(line.geometry.coordinates[0]);
+    const sliceToSnapped = turf.lineSlice(startPoint, snapped, line);
+    const distToSnappedKm = turf.length(sliceToSnapped, {units:'kilometers'}) || 0;
+    const totalKm = turf.length(line, {units:'kilometers'}) || 0;
+    if (totalKm === 0) return 0;
+    return (distToSnappedKm / totalKm) * 100;
   } catch(e) { console.error('computeProgressPercent error', e); return 0; }
 }
 
@@ -549,8 +564,7 @@ function computeRemainingDistanceMeters(robotLatLng, waypoints) {
   try {
     const line = turf.lineString(waypoints.map(w => [w.lon, w.lat]));
     const pt = turf.point([robotLatLng.lng, robotLatLng.lat]);
-    const snapped = turf.nearestPointOnLine(line, pt);
-    // slice from snapped to end
+    const snapped = turf.nearestPointOnLine(line, pt, {units:'kilometers'});
     const endPt = turf.point(line.geometry.coordinates[line.geometry.coordinates.length-1]);
     const slice = turf.lineSlice(snapped, endPt, line);
     const km = turf.length(slice, {units:'kilometers'});
@@ -581,7 +595,6 @@ function startPlayback(){
   const route = [];
   for (let i=0;i<coords.length-1;i++){
     const a = coords[i], b = coords[i+1];
-    // tesselate segment into N points depending on distance
     const seg = turf.lineString([[a[1],a[0]],[b[1],b[0]]]);
     const segKm = turf.length(seg, {units:'kilometers'});
     const points = Math.max(6, Math.round(segKm * 100)); // ~100 pts per km
@@ -602,7 +615,7 @@ function startPlayback(){
     setProgress(computeProgressPercent({lat:p[0], lng:p[1]}, currentMission.waypoints));
     idx++;
     playbackIndex = idx;
-  }, baseDelay / playbackSpeed);
+  }, Math.max(50, baseDelay / playbackSpeed));
 }
 
 function stopPlayback(){
